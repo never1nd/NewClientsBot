@@ -2,9 +2,10 @@
 """
 NewClientsBot: Telegram notifications for new leads.
 
-Mode: pull
-- Bot polls Telegram updates (long polling) for commands.
-- Bot polls website feed endpoint for new leads.
+Modes:
+- mysql: poll website MySQL directly (recommended for InfinityFree)
+- feed: poll website HTTP endpoint
+- auto: mysql if DB env is present, otherwise feed
 """
 
 from __future__ import annotations
@@ -22,26 +23,94 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from urllib.request import Request, urlopen
 
+try:
+    import pymysql  # type: ignore
+except Exception:  # noqa: BLE001
+    pymysql = None  # type: ignore
+
+
+def load_dotenv_file(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                os.environ[key] = value
+    except Exception as exc:  # noqa: BLE001
+        print(f"[env] failed to load .env: {exc}", flush=True)
+
+
+def env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        value = minimum
+    if maximum is not None and value > maximum:
+        value = maximum
+    return value
+
+
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv_file(os.path.join(BASE_DIR, ".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_ADMIN_IDS_RAW = os.getenv("BOT_ADMIN_IDS", "").strip()
-BOT_DB_PATH = os.getenv("BOT_DB_PATH", os.path.join(os.path.dirname(__file__), "bot_state.sqlite"))
-BOT_POLL_TIMEOUT = int(os.getenv("BOT_POLL_TIMEOUT", "25"))
+BOT_DB_PATH = os.getenv("BOT_DB_PATH", os.path.join(BASE_DIR, "bot_state.sqlite"))
+BOT_POLL_TIMEOUT = env_int("BOT_POLL_TIMEOUT", 25, minimum=5, maximum=60)
+
+LEADS_SOURCE = os.getenv("LEADS_SOURCE", "auto").strip().lower() or "auto"
 
 LEADS_FEED_URL = os.getenv("LEADS_FEED_URL", "").strip()
 LEADS_FEED_SECRET = os.getenv("LEADS_FEED_SECRET", "").strip()
-LEADS_POLL_INTERVAL = max(1, int(os.getenv("LEADS_POLL_INTERVAL", "10")))
-LEADS_BATCH_SIZE = max(1, min(100, int(os.getenv("LEADS_BATCH_SIZE", "20"))))
-LEADS_HTTP_TIMEOUT = max(3, int(os.getenv("LEADS_HTTP_TIMEOUT", "20")))
+LEADS_POLL_INTERVAL = env_int("LEADS_POLL_INTERVAL", 10, minimum=1, maximum=300)
+LEADS_BATCH_SIZE = env_int("LEADS_BATCH_SIZE", 20, minimum=1, maximum=100)
+LEADS_HTTP_TIMEOUT = env_int("LEADS_HTTP_TIMEOUT", 20, minimum=3, maximum=120)
+
+LEADS_DB_HOST = os.getenv("LEADS_DB_HOST", "").strip()
+LEADS_DB_PORT = env_int("LEADS_DB_PORT", 3306, minimum=1, maximum=65535)
+LEADS_DB_NAME = os.getenv("LEADS_DB_NAME", "").strip()
+LEADS_DB_USER = os.getenv("LEADS_DB_USER", "").strip()
+LEADS_DB_PASS = os.getenv("LEADS_DB_PASS", "").strip()
+LEADS_DB_CHARSET = os.getenv("LEADS_DB_CHARSET", "utf8mb4").strip() or "utf8mb4"
+LEADS_DB_CONNECT_TIMEOUT = env_int("LEADS_DB_CONNECT_TIMEOUT", 8, minimum=3, maximum=60)
+
+HAS_DB_CONFIG = all([LEADS_DB_HOST, LEADS_DB_NAME, LEADS_DB_USER, LEADS_DB_PASS])
+
+if LEADS_SOURCE not in {"auto", "mysql", "feed"}:
+    LEADS_SOURCE = "auto"
+
+if LEADS_SOURCE == "auto":
+    LEADS_SOURCE = "mysql" if HAS_DB_CONFIG else "feed"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 
-if not LEADS_FEED_URL:
-    raise RuntimeError("LEADS_FEED_URL is required")
-
-if not LEADS_FEED_SECRET:
-    raise RuntimeError("LEADS_FEED_SECRET is required")
+if LEADS_SOURCE == "mysql":
+    if not HAS_DB_CONFIG:
+        raise RuntimeError("MySQL mode selected but LEADS_DB_* variables are incomplete")
+    if pymysql is None:
+        raise RuntimeError("pymysql is required for MySQL mode (add to requirements.txt)")
+else:
+    if not LEADS_FEED_URL:
+        raise RuntimeError("LEADS_FEED_URL is required in feed mode")
+    if not LEADS_FEED_SECRET:
+        raise RuntimeError("LEADS_FEED_SECRET is required in feed mode")
 
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -194,6 +263,92 @@ class Storage:
 
 
 STORAGE = Storage(BOT_DB_PATH)
+
+
+class MySqlLeadSource:
+    def __init__(self) -> None:
+        self.conn: Any = None
+
+    def _connect(self) -> None:
+        self.conn = pymysql.connect(  # type: ignore[operator]
+            host=LEADS_DB_HOST,
+            port=LEADS_DB_PORT,
+            user=LEADS_DB_USER,
+            password=LEADS_DB_PASS,
+            database=LEADS_DB_NAME,
+            charset=LEADS_DB_CHARSET,
+            connect_timeout=LEADS_DB_CONNECT_TIMEOUT,
+            read_timeout=LEADS_HTTP_TIMEOUT,
+            write_timeout=LEADS_HTTP_TIMEOUT,
+            autocommit=True,
+            cursorclass=pymysql.cursors.DictCursor,  # type: ignore[union-attr]
+        )
+
+    def _ensure_conn(self) -> None:
+        if self.conn is None:
+            self._connect()
+            return
+        try:
+            self.conn.ping(reconnect=True)
+        except Exception:
+            self.close()
+            self._connect()
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def fetch(self, after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
+        self._ensure_conn()
+
+        query = (
+            "SELECT id, name, contact, message, source_page, consent, ip, created_at "
+            "FROM leads WHERE id > %s ORDER BY id ASC LIMIT %s"
+        )
+
+        max_id = after_id
+        leads: list[dict[str, Any]] = []
+
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(query, (after_id, limit))
+                rows = cursor.fetchall()
+        except Exception:
+            self.close()
+            raise
+
+        for row in rows:
+            lead_id = int(row.get("id") or 0)
+            if lead_id > max_id:
+                max_id = lead_id
+
+            created = row.get("created_at")
+            if isinstance(created, datetime):
+                created_at = created.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                created_at = str(created or "")
+
+            leads.append(
+                {
+                    "id": lead_id,
+                    "name": str(row.get("name") or "")[:120],
+                    "contact": str(row.get("contact") or "")[:180],
+                    "message": str(row.get("message") or "")[:1200],
+                    "source_page": str(row.get("source_page") or "")[:160],
+                    "created_at": created_at,
+                    "site_host": "",
+                    "ip": str(row.get("ip") or "")[:64],
+                }
+            )
+
+        return leads, max_id
+
+
+MYSQL_SOURCE = MySqlLeadSource() if LEADS_SOURCE == "mysql" else None
 
 
 def is_admin(chat_id: int) -> bool:
@@ -436,6 +591,7 @@ def poll_updates_forever() -> None:
         )
 
         if not response.get("ok"):
+            print(f"[tg] getUpdates error: {response.get('description', 'unknown')}", flush=True)
             time.sleep(3)
             continue
 
@@ -465,7 +621,7 @@ def build_feed_url(after_id: int, limit: int) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
-def fetch_leads(after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
+def fetch_leads_from_feed(after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
     url = build_feed_url(after_id, limit)
     request = Request(url=url, method="GET", headers={"X-Bot-Secret": LEADS_FEED_SECRET})
 
@@ -474,7 +630,7 @@ def fetch_leads(after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
 
     payload = json.loads(raw)
     if not isinstance(payload, dict) or not payload.get("ok"):
-        raise RuntimeError("Feed returned non-ok response")
+        raise RuntimeError(f"Feed returned non-ok response: {str(payload)[:300]}")
 
     leads_raw = payload.get("leads", [])
     if not isinstance(leads_raw, list):
@@ -501,6 +657,15 @@ def fetch_leads(after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
     return leads, max_id
 
 
+def fetch_leads(after_id: int, limit: int) -> tuple[list[dict[str, Any]], int]:
+    if LEADS_SOURCE == "mysql":
+        assert MYSQL_SOURCE is not None
+        leads, max_id = MYSQL_SOURCE.fetch(after_id, limit)
+        return [normalize_lead(lead) for lead in leads], max_id
+
+    return fetch_leads_from_feed(after_id, limit)
+
+
 def poll_leads_forever() -> None:
     after_id = STORAGE.get_last_lead_id()
 
@@ -508,8 +673,16 @@ def poll_leads_forever() -> None:
         try:
             leads, max_id = fetch_leads(after_id=after_id, limit=LEADS_BATCH_SIZE)
 
+            if leads:
+                print(f"[leads] fetched {len(leads)} new lead(s), after_id={after_id} -> max_id={max_id}", flush=True)
+
             for lead in leads:
-                notify_subscribers(lead)
+                result = notify_subscribers(lead)
+                if not result.get("duplicate"):
+                    print(
+                        f"[notify] lead_id={lead.get('id')} sent={result.get('sent', 0)}/{result.get('total', 0)} failed={result.get('failed', 0)}",
+                        flush=True,
+                    )
 
             if max_id > after_id:
                 after_id = max_id
@@ -519,18 +692,38 @@ def poll_leads_forever() -> None:
                 continue
 
             STOP_EVENT.wait(LEADS_POLL_INTERVAL)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            print(f"[leads] error: {exc}", flush=True)
             STOP_EVENT.wait(max(LEADS_POLL_INTERVAL, 3))
+
+
+def bootstrap_admin_subscribers() -> None:
+    if not ADMIN_IDS:
+        return
+    for admin_id in ADMIN_IDS:
+        STORAGE.set_subscriber(admin_id, True, admin_id)
 
 
 def shutdown(signum: int, frame: Any) -> None:  # noqa: ARG001
     STOP_EVENT.set()
+    if MYSQL_SOURCE is not None:
+        MYSQL_SOURCE.close()
 
 
 def main() -> None:
-    print("NewClientsBot starting...")
-    print(f"Admins: {sorted(ADMIN_IDS) if ADMIN_IDS else 'not set'}")
-    print(f"Feed URL: {LEADS_FEED_URL}")
+    print("NewClientsBot starting...", flush=True)
+    print(f"Source mode: {LEADS_SOURCE}", flush=True)
+    print(f"Admins: {sorted(ADMIN_IDS) if ADMIN_IDS else 'not set'}", flush=True)
+
+    if LEADS_SOURCE == "feed":
+        print(f"Feed URL: {LEADS_FEED_URL}", flush=True)
+    else:
+        print(f"DB host: {LEADS_DB_HOST}:{LEADS_DB_PORT}", flush=True)
+        print(f"DB name: {LEADS_DB_NAME}", flush=True)
+        print(f"DB user: {LEADS_DB_USER}", flush=True)
+
+    bootstrap_admin_subscribers()
+    print(f"Enabled subscribers: {len(STORAGE.list_subscribers(enabled_only=True))}", flush=True)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)

@@ -1,1 +1,1 @@
-﻿# This bot uses only Python standard library dependencies.
+﻿pymysql==1.1.1
